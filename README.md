@@ -53,6 +53,11 @@ external database and no neural-network runtime dependency.
 
 ## Changelog
 
+### 0.1.1
+- Performance: rewrote the `conv1d` kernel (branch-free contiguous AXPY inner loop +
+  flattened weight layout). ~7× faster single-thread; **bit-identical output** (same
+  floating-point accumulation order — verified byte-for-byte on a full proteome).
+
 ### 0.1.0
 - Initial release: distilled/trained pure-Rust model, gzip-embedded weights, PyTorch-parity verified.
 

@@ -113,6 +113,22 @@ pub struct Model {
     w: Weights,
     /// aa byte -> channel index (0..nsym-1), or `nsym` sentinel for pad/unknown.
     aa_to_chan: [usize; 256],
+    /// Conv weights flattened to contiguous `[cout*cin*k]` per layer (row-major
+    /// `(co*cin+ci)*k + dk`), so the hot loop reads them without pointer-chasing the
+    /// nested `Vec<Vec<Vec<f32>>>`. Same values, same order — purely a memory layout.
+    conv_wf: Vec<Vec<f32>>,
+}
+
+/// Flatten a `[cout][cin][k]` weight tensor to a contiguous `[cout*cin*k]` vector in
+/// row-major order, preserving element order exactly.
+fn flatten3(w: &[Vec<Vec<f32>>]) -> Vec<f32> {
+    let mut v = Vec::new();
+    for a in w {
+        for b in a {
+            v.extend_from_slice(b);
+        }
+    }
+    v
 }
 
 /// Trained weights, gzip-compressed and embedded at compile time (kept under the
@@ -145,7 +161,12 @@ impl Model {
             aa_to_chan[c.to_ascii_lowercase() as usize] = i;
         }
         // "other" (index 21 in training = channel nsym-1 = 20)
-        Ok(Model { aa_to_chan, w })
+        let conv_wf = vec![
+            flatten3(&w.conv1_w),
+            flatten3(&w.conv2_w),
+            flatten3(&w.conv3_w),
+        ];
+        Ok(Model { aa_to_chan, conv_wf, w })
     }
 
     /// Predict for many sequences in parallel (rayon). Equivalent to mapping
@@ -175,9 +196,9 @@ impl Model {
             }
         }
         // conv stack (ReLU) -> h [C][L]
-        let h1 = conv1d_relu(&oh, nsym, l, &self.w.conv1_w, &self.w.conv1_b, self.w.c, self.w.k);
-        let h2 = conv1d_relu(&h1, self.w.c, l, &self.w.conv2_w, &self.w.conv2_b, self.w.c, self.w.k);
-        let h = conv1d_relu(&h2, self.w.c, l, &self.w.conv3_w, &self.w.conv3_b, self.w.c, self.w.k);
+        let h1 = conv1d_relu(&oh, nsym, l, &self.conv_wf[0], &self.w.conv1_b, self.w.c, self.w.k);
+        let h2 = conv1d_relu(&h1, self.w.c, l, &self.conv_wf[1], &self.w.conv2_b, self.w.c, self.w.k);
+        let h = conv1d_relu(&h2, self.w.c, l, &self.conv_wf[2], &self.w.conv3_b, self.w.c, self.w.k);
         let c = self.w.c;
 
         // type head: global average pool over L, then linear -> 5 logits
@@ -259,35 +280,61 @@ impl Model {
 }
 
 /// `conv1d` with `same` padding (k/2) followed by ReLU. `inp` is `[cin][L]` row-major,
-/// `w` is `[cout][cin][k]`; returns `[cout][L]` row-major.
+/// `w` is flattened `[cout*cin*k]` (`(co*cin+ci)*k + dk`); returns `[cout][L]` row-major.
+///
+/// Loop order is `co -> ci -> dk -> t`: for each `(ci, dk)` tap the innermost loop is a
+/// contiguous `out[t] += w * inp[t + shift]` AXPY over a branch-free `t` range, which the
+/// compiler auto-vectorizes. This is byte-identical to the naive `co -> t -> ci -> dk`
+/// form: for any fixed output element `out[co][t]` the `+=` contributions still arrive in
+/// `ci`-major, `dk`-minor order over exactly the in-bounds taps, so the floating-point
+/// accumulation order — and thus the result — is unchanged. Only the loop nesting and the
+/// (already contiguous) weight layout move.
 fn conv1d_relu(
     inp: &[f32],
     cin: usize,
     l: usize,
-    w: &[Vec<Vec<f32>>],
+    w: &[f32],
     b: &[f32],
     cout: usize,
     k: usize,
 ) -> Vec<f32> {
-    let pad = k / 2;
+    let pad = k as isize / 2;
     let mut out = vec![0.0f32; cout * l];
     for co in 0..cout {
-        let wco = &w[co];
-        let bias = b[co];
-        for t in 0..l {
-            let mut acc = bias;
-            for ci in 0..cin {
-                let wci = &wco[ci];
-                let base = ci * l;
-                for dk in 0..k {
-                    // input index for kernel tap dk at output position t
-                    let ii = t as isize + dk as isize - pad as isize;
-                    if ii >= 0 && (ii as usize) < l {
-                        acc += wci[dk] * inp[base + ii as usize];
-                    }
+        let wco = &w[co * cin * k..(co + 1) * cin * k];
+        let orow = &mut out[co * l..co * l + l];
+        // Seed every output position with the bias (naive form initialised `acc = bias`).
+        for o in orow.iter_mut() {
+            *o = b[co];
+        }
+        for ci in 0..cin {
+            let wci = &wco[ci * k..ci * k + k];
+            let irow = &inp[ci * l..ci * l + l];
+            for dk in 0..k {
+                let wt = wci[dk];
+                let shift = dk as isize - pad;
+                // Valid output positions: 0 <= t < l AND 0 <= t + shift < l. Computing the
+                // range once removes the per-element bounds branch from the hot loop.
+                let (t0, t1) = if shift >= 0 {
+                    (0usize, l.saturating_sub(shift as usize))
+                } else {
+                    (((-shift) as usize).min(l), l)
+                };
+                if t0 >= t1 {
+                    continue;
+                }
+                let src = (t0 as isize + shift) as usize;
+                // orow[t0..t1] += wt * irow[src .. src + (t1-t0)]  (offsets stay in-bounds)
+                for (o, &x) in orow[t0..t1].iter_mut().zip(&irow[src..src + (t1 - t0)]) {
+                    *o += wt * x;
                 }
             }
-            out[co * l + t] = if acc > 0.0 { acc } else { 0.0 };
+        }
+        // ReLU, applied once after accumulation (as in the naive form).
+        for o in orow.iter_mut() {
+            if *o < 0.0 {
+                *o = 0.0;
+            }
         }
     }
     out
