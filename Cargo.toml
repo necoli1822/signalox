@@ -1,0 +1,31 @@
+[package]
+name = "signalox"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["Sunju Kim <n.e.coli.1822@gmail.com>"]
+description = "Pure-Rust bacterial signal-peptide, cleavage-site and transmembrane-topology predictor: a compact CNN+CRF (architecture inspired by DeepSig, Savojardo et al. 2018) with independently-trained weights on UniProt/SwissProt (CC-BY). Database-free, self-contained inference."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/signalox"
+repository = "https://github.com/necoli1822/signalox"
+keywords = ["bioinformatics", "signal-peptide", "transmembrane", "proteomics", "bacteria"]
+categories = ["science", "command-line-utilities"]
+
+[lib]
+name = "signalox"
+
+[[bin]]
+name = "signalox"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }  # gzip-decompress embedded weights (pure Rust)
+rayon = "1"   # data-parallel batch prediction (predict_many); scalar per-seq path unchanged
+
+[dev-dependencies]
+
+[profile.release]
+lto = true
